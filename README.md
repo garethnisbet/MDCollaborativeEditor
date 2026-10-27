@@ -69,11 +69,15 @@ Click **📂** in the top bar (or *Open…* in the file list, or press <kbd>Ctrl
 
 Click **⬇ PDF** in the top bar. The document is rendered in GitHub's light style (even in dark mode) on A4 pages, with maths and diagrams included and without Claude's highlights. It is saved as `<name>.pdf` beside the markdown file and downloaded by the browser. Relative image links resolve because the page is printed from the markdown file's folder. This uses headless Google Chrome or Chromium; set `MDEDIT_CHROME=/path/to/chrome` if it isn't found on the PATH. For the browser's own print dialog, press <kbd>Ctrl</kbd>+<kbd>P</kbd>; the print stylesheet prints only the rendered document.
 
+## Exporting to Word
+
+Click **⬇ Word** in the top bar to save the document as `<name>.docx` beside the markdown file; the browser downloads it too. Headings, lists, tables, links, images and syntax-highlighted code come through as ordinary Word formatting, and maths becomes editable Word equations. Mermaid diagrams are inserted as pictures, GitHub alerts become block quotes, and task-list boxes become ☑/☐. This uses [pandoc](https://pandoc.org/installing.html); set `MDEDIT_PANDOC=/path/to/pandoc` if it isn't found on the PATH.
+
 ## Files
 
 All code lives in `src/md_collab_editor/`:
 
-- `server.py`: HTTP server (file API, folder browsing and root switching, change events, `/api/ask` → `claude -p`, `/api/pdf` → headless Chrome)
+- `server.py`: HTTP server (file API, folder browsing and root switching, change events, `/api/ask` → `claude -p`, `/api/pdf` → headless Chrome, `/api/docx` → pandoc)
 - `static/index.html`, `static/app.css`: layout and GitHub-style theme
 - `static/render.js`: markdown → HTML, with source offsets on every block so preview selections map back to the source
 - `static/app.js`: editor, sync, selection mapping, ask bar, suggestion cards and word diff

@@ -11,15 +11,18 @@ up live), and answers "ask Claude" requests by running `claude -p` headless.
 """
 
 import argparse
+import html as htmllib
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import webbrowser
+import zipfile
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -34,6 +37,7 @@ ROOT: Path = Path.cwd()
 CLAUDE_BIN = shutil.which("claude") or "claude"
 CHROME_BIN = next((b for b in (os.environ.get("MDEDIT_CHROME"), "google-chrome", "google-chrome-stable",
                                "chromium", "chromium-browser") if b and shutil.which(b)), None)
+PANDOC_BIN = os.environ.get("MDEDIT_PANDOC") or shutil.which("pandoc")
 
 PDF_TEMPLATE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>{title}</title>
@@ -238,10 +242,77 @@ def export_pdf(req):
     finally:
         tmp_html.unlink(missing_ok=True)
         shutil.rmtree(profile, ignore_errors=True)
-    return {"pdf": pdf.relative_to(ROOT).as_posix(), "bytes": pdf.stat().st_size}
+    return {"file": pdf.relative_to(ROOT).as_posix(), "bytes": pdf.stat().st_size}
+
+
+# ---------------------------------------------------------------- docx
+
+RAW_SRC = re.compile(r'src="/raw/([^"]*)"')
+
+
+TABLE_XML = re.compile(r"<w:tbl>.*?</w:tbl>", re.S)
+TABLE_BORDERS = "<w:tblBorders>" + "".join(
+    f'<w:{side} w:val="single" w:sz="4" w:space="0" w:color="D0D7DE"/>'
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV")) + "</w:tblBorders>"
+
+
+def fix_table(m):
+    """Give a pandoc table full width, equal columns and light borders.
+
+    Older pandoc writes an empty column grid and zero width, which Word copes
+    with but LibreOffice and Google Docs collapse.
+    """
+    t = m[0]
+    first_row = re.search(r"<w:tr>.*?</w:tr>", t, re.S)
+    if "<w:tblGrid />" in t and first_row:
+        cols = max(1, len(re.findall(r"<w:tc>", first_row[0])))
+        grid = "".join(f'<w:gridCol w:w="{9000 // cols}"/>' for _ in range(cols))
+        t = t.replace("<w:tblGrid />", f"<w:tblGrid>{grid}</w:tblGrid>", 1)
+        t = re.sub(r'<w:tblW w:type="pct" w:w="0(?:\.0)?" />', '<w:tblW w:type="pct" w:w="5000" />', t, count=1)
+    if "<w:tblBorders>" not in t:
+        t = t.replace("<w:tblLook", TABLE_BORDERS + "<w:tblLook", 1)
+    return t
+
+
+def fix_docx_tables(path: Path):
+    with zipfile.ZipFile(path) as z:
+        items = [(info, z.read(info)) for info in z.infolist()]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for info, data in items:
+            if info.filename == "word/document.xml":
+                data = TABLE_XML.sub(fix_table, data.decode("utf-8")).encode("utf-8")
+            z.writestr(info, data)
+
+
+def export_docx(req):
+    """Convert the editor's rendered HTML to <name>.docx beside the markdown file with pandoc."""
+    if not PANDOC_BIN:
+        raise RuntimeError("Word export needs pandoc (https://pandoc.org/installing.html, or set MDEDIT_PANDOC)")
+    md = safe_path(req["path"])
+    docx = md.with_suffix(".docx")
+    # images point at the /raw/ route; pandoc reads them straight from disk instead
+    body = RAW_SRC.sub(lambda m: f'src="{htmllib.escape(str(ROOT / unquote(htmllib.unescape(m[1]))))}"', req["html"])
+    page = f'<!doctype html><html><head><meta charset="utf-8"></head><body>{body}</body></html>'
+    tmp = docx.with_name(f".{docx.name}.tmp")
+    try:
+        proc = subprocess.run(
+            [PANDOC_BIN, "-f", "html", "-t", "docx", "--resource-path", str(md.parent), "-o", str(tmp)],
+            input=page, capture_output=True, text=True, timeout=120, cwd=md.parent)
+        if proc.returncode != 0 or not tmp.exists():
+            raise RuntimeError(f"pandoc failed: {(proc.stderr or proc.stdout).strip()[-800:]}")
+        fix_docx_tables(tmp)
+        os.replace(tmp, docx)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return {"file": docx.relative_to(ROOT).as_posix(), "bytes": docx.stat().st_size}
 
 
 # ---------------------------------------------------------------- http
+
+DOWNLOAD_TYPES = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
@@ -288,11 +359,12 @@ class Handler(SimpleHTTPRequestHandler):
                                        "skills": list_skills(), "files": list_files()})
             if u.path == "/api/download":
                 p = safe_path(q["path"])
-                if not p.is_file() or p.suffix.lower() != ".pdf":
+                ctype = DOWNLOAD_TYPES.get(p.suffix.lower())
+                if not p.is_file() or not ctype:
                     return self.send_json({"error": "not found"}, 404)
                 data = p.read_bytes()
                 self.send_response(200)
-                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Type", ctype)
                 self.send_header("Content-Disposition", f'attachment; filename="{p.name}"')
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -340,6 +412,8 @@ class Handler(SimpleHTTPRequestHandler):
             req = self.read_json()
             if u.path == "/api/pdf":
                 return self.send_json(export_pdf(req))
+            if u.path == "/api/docx":
+                return self.send_json(export_docx(req))
             if u.path == "/api/root":
                 initial = set_root(req["path"])
                 print(f"[root] {ROOT}", flush=True)

@@ -927,42 +927,128 @@ $('#browser').addEventListener('keydown', e => {
   else if (e.key === 'Backspace' && e.altKey && browseState?.parent) { e.preventDefault(); browseTo(browseState.parent); }
 });
 
-// ------------------------------------------------------------------ PDF export
+// ------------------------------------------------------------------ PDF / Word export
 
-async function exportPdf() {
-  if (!cur.path) return;
-  if (cur.dirty) await save();
-  const btn = $('#export-pdf');
-  btn.disabled = true;
-  setSaveState('Exporting PDF…');
+// Render a clean light-theme copy of the document (no dark mode, no Claude highlights)
+// into an off-screen box, let `prepare` adjust it, and return its HTML.
+async function exportHtml(prepare) {
+  const wasDark = document.documentElement.dataset.theme === 'dark';
+  if (wasDark) MD.initMermaid(false);
+  const box = document.createElement('div');
+  box.style.cssText = 'position:absolute;left:-10000px;top:0;width:800px';
+  box.className = 'markdown-body';
+  document.body.appendChild(box);
   try {
-    // render a clean light-theme copy so dark mode and Claude highlights stay out of the PDF
-    const wasDark = document.documentElement.dataset.theme === 'dark';
-    if (wasDark) MD.initMermaid(false);
-    const box = document.createElement('div');
-    box.style.cssText = 'position:absolute;left:-10000px;top:0;width:800px';
-    box.className = 'markdown-body';
-    document.body.appendChild(box);
     MD.render(cm.getValue(), box);
     await MD.mermaidDone();
     box.querySelectorAll('[data-s]').forEach(el => { delete el.dataset.s; delete el.dataset.e; });
     box.querySelectorAll('input[type=checkbox]').forEach(b => { b.setAttribute('disabled', ''); if (b.checked) b.setAttribute('checked', ''); });
-    const html = box.innerHTML;
+    if (prepare) await prepare(box);
+    return box.innerHTML;
+  } finally {
     box.remove();
     if (wasDark) { MD.initMermaid(true); renderPreview(); }
-    const r = await api('POST', '/api/pdf', { path: cur.path, html });
-    setSaveState(`Exported ${r.pdf} (${Math.round(r.bytes / 1024)} KB)`, 'ok');
-    const a = Object.assign(document.createElement('a'), { href: `/api/download?path=${encodeURIComponent(r.pdf)}`, download: r.pdf.split('/').pop() });
+  }
+}
+
+// Draw an inline SVG (a mermaid diagram) onto a canvas and return it as a PNG data URI.
+function svgToPng(svg, scale = 2) {
+  const r = svg.getBoundingClientRect();
+  const w = Math.ceil(r.width) || 600, h = Math.ceil(r.height) || 400;
+  const clone = svg.cloneNode(true);
+  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  clone.setAttribute('width', w);
+  clone.setAttribute('height', h);
+  const url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(new XMLSerializer().serializeToString(clone));
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const c = Object.assign(document.createElement('canvas'), { width: w * scale, height: h * scale });
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, c.width, c.height);
+        ctx.drawImage(img, 0, 0, c.width, c.height);
+        resolve({ src: c.toDataURL('image/png'), w, h });
+      } catch (e) { reject(e); }
+    };
+    img.onerror = () => reject(new Error('could not draw diagram'));
+    img.src = url;
+  });
+}
+
+// Reshape the rendered HTML into something pandoc turns into a tidy Word document.
+async function prepareForWord(box) {
+  box.querySelectorAll('.anchor, .octicon').forEach(el => el.remove());
+  // plain text with a bare language class lets pandoc colour the code itself
+  box.querySelectorAll('pre > code').forEach(code => {
+    const lang = [...code.classList].find(c => c.startsWith('language-'));
+    code.parentElement.className = lang ? lang.slice(9) : '';
+    code.removeAttribute('class');
+    code.textContent = code.textContent;
+  });
+  // KaTeX keeps a MathML copy of each formula; pandoc turns MathML into Word equations
+  box.querySelectorAll('.katex-display, .katex').forEach(k => {
+    if (!k.isConnected) return;
+    const math = k.querySelector('.katex-mathml math');
+    if (!math) return;
+    if (k.classList.contains('katex-display')) {
+      math.setAttribute('display', 'block');
+      const p = document.createElement('p');
+      p.appendChild(math);
+      k.replaceWith(p);
+    } else k.replaceWith(math);
+  });
+  for (const mbox of box.querySelectorAll('.mermaid-box')) {
+    const svg = mbox.querySelector('svg');
+    let repl;
+    if (svg) {
+      try {
+        const { src, w, h } = await svgToPng(svg);
+        const width = Math.min(w, 620);
+        repl = Object.assign(document.createElement('p'), { innerHTML: `<img src="${src}" width="${width}" height="${Math.round(h * width / w)}">` });
+      } catch (e) { /* fall back to the diagram source */ }
+    }
+    if (!repl) {
+      repl = document.createElement('pre');
+      repl.textContent = mbox.querySelector('.mermaid-src')?.textContent || '';
+    }
+    mbox.replaceWith(repl);
+  }
+  box.querySelectorAll('input[type=checkbox]').forEach(b => b.replaceWith(document.createTextNode(b.checked ? '☑ ' : '☐ ')));
+  // GitHub alerts become block quotes with a bold title
+  box.querySelectorAll('.markdown-alert').forEach(a => {
+    const q = document.createElement('blockquote');
+    const title = a.querySelector('.markdown-alert-title');
+    if (title) title.innerHTML = `<strong>${MD.esc(title.textContent.trim())}</strong>`;
+    q.append(...a.childNodes);
+    a.replaceWith(q);
+  });
+}
+
+async function exportDoc(kind) {
+  if (!cur.path) return;
+  if (cur.dirty) await save();
+  const label = kind === 'pdf' ? 'PDF' : 'Word';
+  const btn = $(`#export-${kind}`);
+  btn.disabled = true;
+  setSaveState(`Exporting ${label}…`);
+  try {
+    const html = await exportHtml(kind === 'docx' ? prepareForWord : null);
+    const r = await api('POST', `/api/${kind}`, { path: cur.path, html });
+    setSaveState(`Exported ${r.file} (${Math.round(r.bytes / 1024)} KB)`, 'ok');
+    const a = Object.assign(document.createElement('a'), { href: `/api/download?path=${encodeURIComponent(r.file)}`, download: r.file.split('/').pop() });
     document.body.appendChild(a);
     a.click();
     a.remove();
   } catch (e) {
-    setSaveState(`PDF export failed: ${e.message}`, 'err');
+    setSaveState(`${label} export failed: ${e.message}`, 'err');
   } finally {
     btn.disabled = false;
   }
 }
-$('#export-pdf').onclick = exportPdf;
+$('#export-pdf').onclick = () => exportDoc('pdf');
+$('#export-docx').onclick = () => exportDoc('docx');
 
 // ------------------------------------------------------------------ layout & theme
 
